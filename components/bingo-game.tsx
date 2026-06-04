@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import confetti from "canvas-confetti";
+import { supabase } from "@/lib/supabase";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -43,10 +44,19 @@ interface CompletedLine {
   time: number;
 }
 
+interface Speler {
+  naam: string;
+  score: number;
+  voltooid: boolean;
+  voltooid_tijd: number | null;
+}
+
 export function BingoGame() {
   const [gameState, setGameState] = useState<GameState>("start");
   const [username, setUsername] = useState("");
   const [usernameInput, setUsernameInput] = useState("");
+  const [roomInput, setRoomInput] = useState("");
+  const [roomCode, setRoomCode] = useState("");
   const [checkedCells, setCheckedCells] = useState<boolean[][]>(
     Array(ROWS).fill(null).map(() => Array(COLS).fill(false))
   );
@@ -56,11 +66,19 @@ export function BingoGame() {
   const [showEndConfirm, setShowEndConfirm] = useState(false);
   const [animatingLines, setAnimatingLines] = useState<Set<string>>(new Set());
   const [showFullCardAnimation, setShowFullCardAnimation] = useState(false);
+  const [spelers, setSpelers] = useState<Speler[]>([]);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const elapsedRef = useRef(0);
+  const syncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const checkedCount = checkedCells.flat().filter(Boolean).length;
   const totalCells = ROWS * COLS;
   const remainingCount = totalCells - checkedCount;
+
+  // Houd een ref bij van de tijd, zodat de sync-functie de actuele waarde kent
+  useEffect(() => {
+    elapsedRef.current = elapsedTime;
+  }, [elapsedTime]);
 
   // Timer logic
   useEffect(() => {
@@ -75,6 +93,66 @@ export function BingoGame() {
       }
     };
   }, [gameState]);
+
+  // Schrijf de eigen score naar Supabase (gedebounced)
+  const syncScore = useCallback(
+    (score: number, voltooid: boolean) => {
+      if (!roomCode || !username) return;
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+      syncTimeoutRef.current = setTimeout(async () => {
+        await supabase.from("bingo_spelers").upsert(
+          {
+            room_code: roomCode,
+            naam: username,
+            score,
+            voltooid,
+            voltooid_tijd: voltooid ? elapsedRef.current : null,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "room_code,naam" }
+        );
+      }, 250);
+    },
+    [roomCode, username]
+  );
+
+  // Laad de ranglijst en abonneer op realtime updates
+  useEffect(() => {
+    if (gameState === "start" || !roomCode) return;
+
+    let active = true;
+
+    const laadSpelers = async () => {
+      const { data } = await supabase
+        .from("bingo_spelers")
+        .select("naam, score, voltooid, voltooid_tijd")
+        .eq("room_code", roomCode);
+      if (active && data) setSpelers(data as Speler[]);
+    };
+
+    laadSpelers();
+
+    const channel = supabase
+      .channel(`room-${roomCode}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "bingo_spelers",
+          filter: `room_code=eq.${roomCode}`,
+        },
+        () => {
+          laadSpelers();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      active = false;
+      supabase.removeChannel(channel);
+    };
+  }, [gameState, roomCode]);
 
   const triggerConfetti = useCallback(() => {
     confetti({
@@ -193,13 +271,33 @@ export function BingoGame() {
       r.map((c, ci) => (ri === row && ci === col ? !c : c))
     );
     setCheckedCells(newCells);
+
+    const newScore = newCells.flat().filter(Boolean).length;
+    const allChecked = newCells.flat().every(Boolean);
+    syncScore(newScore, allChecked);
+
     checkForCompletedLines(newCells, elapsedTime);
   };
 
   const startGame = () => {
-    if (usernameInput.trim()) {
-      setUsername(usernameInput.trim());
+    if (usernameInput.trim() && roomInput.trim()) {
+      const naam = usernameInput.trim();
+      const code = roomInput.trim().toUpperCase();
+      setUsername(naam);
+      setRoomCode(code);
       setGameState("playing");
+      // Schrijf direct een beginrij (score 0), zodat anderen je in de ranglijst zien
+      supabase.from("bingo_spelers").upsert(
+        {
+          room_code: code,
+          naam,
+          score: 0,
+          voltooid: false,
+          voltooid_tijd: null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "room_code,naam" }
+      );
     }
   };
 
@@ -213,6 +311,9 @@ export function BingoGame() {
     setGameState("start");
     setUsernameInput("");
     setUsername("");
+    setRoomInput("");
+    setRoomCode("");
+    setSpelers([]);
   };
 
   const endGame = () => {
@@ -229,6 +330,17 @@ export function BingoGame() {
     return false;
   };
 
+  // Ranglijst gesorteerd: hoogste score eerst, bij gelijke score snelste voltooi-tijd eerst
+  const ranglijst = [...spelers].sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.voltooid && b.voltooid) {
+      return (a.voltooid_tijd ?? Infinity) - (b.voltooid_tijd ?? Infinity);
+    }
+    if (a.voltooid) return -1;
+    if (b.voltooid) return 1;
+    return 0;
+  });
+
   // Start screen
   if (gameState === "start") {
     return (
@@ -238,7 +350,8 @@ export function BingoGame() {
           <h1 className="text-3xl font-bold text-orange-600 mb-2">Deventer Kermis</h1>
           <h2 className="text-2xl font-bold text-amber-600 mb-6">BINGO!</h2>
           <p className="text-gray-600 mb-6">
-            Spot typische kermisgangers en vink ze af op je bingokaart!
+            Spot typische kermisgangers en vink ze af. Speel samen: gebruik dezelfde
+            roomcode als je vrienden om elkaars score live te zien!
           </p>
           <div className="space-y-4">
             <div className="text-left">
@@ -254,9 +367,25 @@ export function BingoGame() {
                 onKeyDown={(e) => e.key === "Enter" && startGame()}
               />
             </div>
+            <div className="text-left">
+              <Label htmlFor="room" className="text-gray-700">
+                Roomcode
+              </Label>
+              <Input
+                id="room"
+                value={roomInput}
+                onChange={(e) => setRoomInput(e.target.value.toUpperCase())}
+                placeholder="bv. KERMIS"
+                className="mt-1 text-base uppercase"
+                onKeyDown={(e) => e.key === "Enter" && startGame()}
+              />
+              <p className="text-xs text-gray-400 mt-1">
+                Verzin er samen één. Iedereen met dezelfde code speelt in dezelfde groep.
+              </p>
+            </div>
             <Button
               onClick={startGame}
-              disabled={!usernameInput.trim()}
+              disabled={!usernameInput.trim() || !roomInput.trim()}
               className="w-full bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white font-bold py-4 text-base sm:py-6 sm:text-lg"
             >
               Start het spel! 🎯
@@ -313,6 +442,37 @@ export function BingoGame() {
               </div>
             )}
           </div>
+
+          {/* Eindstand van de groep */}
+          {ranglijst.length > 0 && (
+            <div className="bg-gray-100 rounded-xl p-4 mb-6 text-left">
+              <p className="text-sm font-semibold text-gray-700 mb-2 text-center">
+                🏁 Eindstand (room {roomCode})
+              </p>
+              <div className="space-y-1">
+                {ranglijst.map((s, i) => (
+                  <div
+                    key={s.naam}
+                    className={`flex justify-between items-center text-sm px-2 py-1 rounded ${
+                      s.naam === username ? "bg-orange-100 font-semibold" : ""
+                    }`}
+                  >
+                    <span>
+                      {i + 1}. {s.naam}
+                      {s.voltooid && " 🏆"}
+                    </span>
+                    <span className="text-gray-600">
+                      {s.score}/{totalCells}
+                      {s.voltooid && s.voltooid_tijd != null && (
+                        <span className="text-orange-600"> · {formatTime(s.voltooid_tijd)}</span>
+                      )}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           <Button
             onClick={resetGame}
             className="w-full bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white font-bold py-4 text-base sm:py-6 sm:text-lg"
@@ -326,13 +486,16 @@ export function BingoGame() {
 
   // Playing screen
   return (
-    <div className="min-h-screen bg-gradient-to-br from-amber-400 via-orange-500 to-red-500 p-2 sm:p-4">
+    <div className="min-h-screen bg-gradient-to-br from-amber-400 via-orange-500 to-red-500 p-2 sm:p-4 pt-[max(0.5rem,env(safe-area-inset-top))]">
       {/* Header */}
       <div className="bg-white/90 backdrop-blur rounded-2xl p-3 sm:p-4 mb-3 shadow-lg">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <div>
             <h1 className="text-xl sm:text-2xl font-bold text-orange-600">🎡 Deventer Kermis Bingo</h1>
-            <p className="text-sm text-gray-600">Speler: <span className="font-semibold">{username}</span></p>
+            <p className="text-sm text-gray-600">
+              Speler: <span className="font-semibold">{username}</span>
+              <span className="text-gray-400"> · room {roomCode}</span>
+            </p>
           </div>
           <div className="flex items-center gap-3 sm:gap-4">
             <div className="text-center">
@@ -369,6 +532,38 @@ export function BingoGame() {
         </div>
       </div>
 
+      {/* Live ranglijst */}
+      {ranglijst.length > 0 && (
+        <div className="bg-white/90 backdrop-blur rounded-xl p-3 mb-3 shadow-lg">
+          <p className="text-sm font-semibold text-orange-600 mb-2">🏁 Ranglijst (live)</p>
+          <div className="space-y-1">
+            {ranglijst.map((s, i) => (
+              <div
+                key={s.naam}
+                className={`flex items-center gap-2 text-sm px-2 py-1 rounded ${
+                  s.naam === username ? "bg-orange-100 font-semibold" : ""
+                }`}
+              >
+                <span className="w-5 text-gray-500">{i + 1}.</span>
+                <span className="flex-1 truncate">
+                  {s.naam}
+                  {s.voltooid && " 🏆"}
+                </span>
+                <div className="flex-1 max-w-[120px] bg-gray-200 rounded-full h-2 overflow-hidden">
+                  <div
+                    className="bg-gradient-to-r from-green-400 to-green-600 h-full transition-all duration-500"
+                    style={{ width: `${(s.score / totalCells) * 100}%` }}
+                  />
+                </div>
+                <span className="text-gray-600 tabular-nums w-12 text-right">
+                  {s.score}/{totalCells}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Completed lines info */}
       {completedLines.length > 0 && (
         <div className="bg-green-100/90 backdrop-blur rounded-xl p-3 mb-3 shadow-lg">
@@ -390,8 +585,11 @@ export function BingoGame() {
       )}
 
       {/* Bingo Card */}
-      <div className="bg-white/90 backdrop-blur rounded-2xl p-2 sm:p-3 shadow-lg overflow-x-auto">
-        <div className="grid gap-1 sm:gap-1.5" style={{ gridTemplateColumns: `repeat(${COLS}, minmax(0, 1fr))` }}>
+      <div className="bg-white/90 backdrop-blur rounded-2xl p-2 sm:p-3 shadow-lg">
+        <div
+          className="grid gap-1 sm:gap-1.5"
+          style={{ gridTemplateColumns: `repeat(${COLS}, minmax(0, 1fr))` }}
+        >
           {BINGO_ITEMS.map((row, rowIndex) =>
             row.map((item, colIndex) => {
               const isChecked = checkedCells[rowIndex][colIndex];
@@ -401,11 +599,12 @@ export function BingoGame() {
                   key={`${rowIndex}-${colIndex}`}
                   onClick={() => toggleCell(rowIndex, colIndex)}
                   className={`
-                    relative aspect-square p-1 sm:p-2 rounded-lg text-[9px] sm:text-xs font-medium
+                    relative aspect-square p-0.5 sm:p-2 rounded-lg
+                    text-[7px] leading-[1.1] sm:text-xs font-medium
                     transition-all duration-300 ease-out
                     flex items-center justify-center text-center
-                    min-h-[60px] sm:min-h-[80px]
-                    border-2
+                    min-h-[44px] sm:min-h-[80px]
+                    border-2 overflow-hidden
                     ${
                       isChecked
                         ? "bg-green-500 text-white border-green-600 shadow-[0_0_15px_rgba(34,197,94,0.6)]"
@@ -415,7 +614,7 @@ export function BingoGame() {
                     active:scale-95
                   `}
                 >
-                  <span className="leading-tight">{item}</span>
+                  <span className="leading-[1.1] break-words hyphens-auto px-0.5">{item}</span>
                   {isChecked && (
                     <span className="absolute top-0.5 right-0.5 text-base sm:text-lg">✓</span>
                   )}
