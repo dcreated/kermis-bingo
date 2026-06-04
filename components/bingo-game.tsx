@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import confetti from "canvas-confetti";
-import { supabase } from "@/lib/supabase";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -412,7 +411,7 @@ export function BingoGame() {
             </>
           ) : (
             <>
-              <div className="text-6xl mb-4">🎡</div>
+              <div className="text-6xl mb-4">���</div>
               <h1 className="text-3xl font-bold text-orange-600 mb-2">Spel Beëindigd</h1>
               <h2 className="text-xl text-gray-700 mb-6">
                 Bedankt voor het spelen, <span className="font-bold text-orange-600">{username}</span>!
