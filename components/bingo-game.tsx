@@ -306,19 +306,31 @@ export function BingoGame() {
       setCheckedCells(optimistic);
       checkForCompletedLines(optimistic, elapsedTime);
 
-      if (isNuAangevinkt) {
-        supabase.from("bingo_room_state").delete().eq("room_code", roomCode).eq("cell_index", idx);
+    if (isNuAangevinkt) {
         setCheckedBy((prev) => {
           const copy = { ...prev };
           delete copy[idx];
           return copy;
         });
+        supabase
+          .from("bingo_room_state")
+          .delete()
+          .eq("room_code", roomCode)
+          .eq("cell_index", idx)
+          .then(({ error }) => {
+            if (error) console.error("delete room_state faalde:", error);
+          });
       } else {
-        supabase.from("bingo_room_state").upsert(
-          { room_code: roomCode, cell_index: idx, checked_by: username, checked_at: new Date().toISOString() },
-          { onConflict: "room_code,cell_index" }
-        );
         setCheckedBy((prev) => ({ ...prev, [idx]: username }));
+        supabase
+          .from("bingo_room_state")
+          .upsert(
+            { room_code: roomCode, cell_index: idx, checked_by: username, checked_at: new Date().toISOString() },
+            { onConflict: "room_code,cell_index" }
+          )
+          .then(({ error }) => {
+            if (error) console.error("upsert room_state faalde:", error);
+          });
       }
       return;
     }
